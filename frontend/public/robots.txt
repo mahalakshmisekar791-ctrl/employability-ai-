@@ -1,0 +1,119 @@
+
+import json
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.api.deps import get_current_institution
+from app.models.models import (
+    Institution, InstitutionMember, MemberStatus,
+    StudentProfile, EmployabilityScore, User,
+)
+from app.schemas.schemas import InstitutionResponse, AddStudentRequest
+
+router = APIRouter(prefix="/institution", tags=["Institution"])
+
+
+@router.get("/profile", response_model=InstitutionResponse)
+async def get_profile(
+    institution: Institution = Depends(get_current_institution)
+):
+    return institution
+
+
+@router.post("/students/add", status_code=201)
+async def add_student(
+    payload: AddStudentRequest,
+    institution: Institution = Depends(get_current_institution),
+    db: AsyncSession = Depends(get_db),
+):
+    user = (await db.execute(
+        select(User).where(User.email == payload.student_email)
+    )).scalar_one_or_none()
+    if not user:
+        raise HTTPException(404, "Student not found. They must register first.")
+
+    profile = (await db.execute(
+        select(StudentProfile).where(StudentProfile.user_id == user.id)
+    )).scalar_one_or_none()
+    if not profile:
+        raise HTTPException(404, "Student profile not found.")
+
+    exists = (await db.execute(
+        select(InstitutionMember).where(
+            InstitutionMember.institution_id == institution.id,
+            InstitutionMember.student_id == profile.id,
+        )
+    )).scalar_one_or_none()
+    if exists:
+        raise HTTPException(400, "Student already in your institution.")
+
+    if payload.roll_number:
+        profile.roll_number = payload.roll_number
+
+    db.add(InstitutionMember(
+        institution_id=institution.id,
+        student_id=profile.id
+    ))
+    await db.commit()
+    return {"message": f"✅ {user.full_name} added successfully!"}
+
+
+@router.get("/students")
+async def list_students(
+    institution: Institution = Depends(get_current_institution),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(User, StudentProfile, EmployabilityScore)
+        .join(StudentProfile, User.id == StudentProfile.user_id)
+        .join(InstitutionMember, InstitutionMember.student_id == StudentProfile.id)
+        .outerjoin(EmployabilityScore, EmployabilityScore.student_id == StudentProfile.id)
+        .where(InstitutionMember.institution_id == institution.id)
+        .where(InstitutionMember.status == MemberStatus.ACTIVE)
+    )
+    rows = result.all()
+    return [
+        {
+            "name":           u.full_name,
+            "email":          u.email,
+            "department":     p.department,
+            "cgpa":           p.cgpa,
+            "overall_score":  s.overall_score if s else None,
+            "placement_prob": s.placement_probability if s else None,
+        }
+        for u, p, s in rows
+    ]
+
+
+@router.get("/analytics")
+async def get_analytics(
+    institution: Institution = Depends(get_current_institution),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(EmployabilityScore, StudentProfile)
+        .join(StudentProfile, EmployabilityScore.student_id == StudentProfile.id)
+        .join(InstitutionMember, InstitutionMember.student_id == StudentProfile.id)
+        .where(InstitutionMember.institution_id == institution.id)
+    )
+    rows = result.all()
+    if not rows:
+        return {"message": "No student data yet."}
+
+    scores = [r.EmployabilityScore.overall_score or 0 for r in rows]
+    avg = round(sum(scores) / len(scores), 2)
+    dist = {"0-40": 0, "40-60": 0, "60-75": 0, "75-90": 0, "90-100": 0}
+    for s in scores:
+        if s < 40:    dist["0-40"] += 1
+        elif s < 60:  dist["40-60"] += 1
+        elif s < 75:  dist["60-75"] += 1
+        elif s < 90:  dist["75-90"] += 1
+        else:         dist["90-100"] += 1
+
+    return {
+        "total_students":     len(rows),
+        "avg_overall_score":  avg,
+        "score_distribution": dist,
+    }
